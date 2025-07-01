@@ -21,6 +21,16 @@ defmodule Plausible.Plugs.HandleExpiredSession do
 
   defp maybe_trigger_login(conn, user_session) do
     if Plausible.Users.type(user_session.user) == :sso do
+      # Log SSO session expiration/revocation
+      Plausible.Auth.SSO.Audit.log_session_event(user_session, user_session.user, :revoked, %{
+        ip_address: get_ip_address(conn),
+        user_agent: get_user_agent(conn),
+        details: %{
+          revocation_method: "automatic_expiration",
+          expired_at: user_session.timeout_at
+        }
+      })
+
       Plausible.Auth.UserSessions.revoke_by_id(user_session.user, user_session.id)
       trigger_sso_login(conn, user_session.user.email)
     else
@@ -60,5 +70,18 @@ defmodule Plausible.Plugs.HandleExpiredSession do
         )
     )
     |> halt()
+  end
+
+  defp get_ip_address(conn) do
+    conn
+    |> PlausibleWeb.RemoteIP.get()
+    |> to_string()
+  end
+
+  defp get_user_agent(conn) do
+    case Plug.Conn.get_req_header(conn, "user-agent") do
+      [user_agent | _] -> user_agent
+      [] -> nil
+    end
   end
 end

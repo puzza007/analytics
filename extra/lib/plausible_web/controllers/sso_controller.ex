@@ -105,7 +105,26 @@ defmodule PlausibleWeb.SSOController do
 
   def delete_session(conn, %{"session_id" => session_id}) do
     current_team = conn.assigns.current_team
+    current_user = conn.assigns.current_user
+
+    # Get session details before revocation for audit logging
+    session = Plausible.Repo.get(Plausible.Auth.UserSession, session_id)
+    session_user = if session, do: Plausible.Repo.get(Plausible.Auth.User, session.user_id)
+
     Auth.UserSessions.revoke_sso_by_id(current_team, session_id)
+
+    # Log SSO session revocation if session and user were found
+    if session && session_user do
+      Auth.SSO.Audit.log_session_event(session, session_user, :revoked, %{
+        actor_id: current_user.id,
+        ip_address: get_ip_address(conn),
+        user_agent: get_user_agent(conn),
+        details: %{
+          revocation_method: "admin_action",
+          team_id: current_team.id
+        }
+      })
+    end
 
     conn
     |> put_flash(:success, "Session logged out successfully")
@@ -114,5 +133,18 @@ defmodule PlausibleWeb.SSOController do
 
   defp saml_adapter() do
     Application.fetch_env!(:plausible, :sso_saml_adapter)
+  end
+
+  defp get_ip_address(conn) do
+    conn
+    |> PlausibleWeb.RemoteIP.get()
+    |> to_string()
+  end
+
+  defp get_user_agent(conn) do
+    case Plug.Conn.get_req_header(conn, "user-agent") do
+      [user_agent | _] -> user_agent
+      [] -> nil
+    end
   end
 end

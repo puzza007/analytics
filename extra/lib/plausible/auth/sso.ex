@@ -69,8 +69,16 @@ defmodule Plausible.Auth.SSO do
     changeset = SSO.Integration.update_changeset(integration, params)
 
     case Repo.update(changeset) do
-      {:ok, integration} -> {:ok, integration}
-      {:error, changeset} -> {:error, changeset.changes.config}
+      {:ok, updated_integration} ->
+        # Log SSO integration update
+        SSO.Audit.log_integration_event(updated_integration, :updated, %{
+          details: %{updated_fields: Map.keys(params)}
+        })
+
+        {:ok, updated_integration}
+
+      {:error, changeset} ->
+        {:error, changeset.changes.config}
     end
   end
 
@@ -98,17 +106,34 @@ defmodule Plausible.Auth.SSO do
   def deprovision_user!(%{type: :standard} = user), do: user
 
   def deprovision_user!(user) do
-    user = Repo.preload(user, [:sso_integration, :sso_domain])
+    user = Repo.preload(user, [:sso_integration, :sso_domain, team_memberships: :team])
 
     :ok = Auth.UserSessions.revoke_all(user)
 
-    user
-    |> Ecto.Changeset.change()
-    |> Ecto.Changeset.put_change(:type, :standard)
-    |> Ecto.Changeset.put_change(:sso_identity_id, nil)
-    |> Ecto.Changeset.put_assoc(:sso_integration, nil)
-    |> Ecto.Changeset.put_assoc(:sso_domain, nil)
-    |> Repo.update!()
+    # Get team for audit logging
+    team = case user.team_memberships do
+      [membership | _] -> membership.team
+      [] -> %{id: nil, name: "unknown"}
+    end
+
+    updated_user =
+      user
+      |> Ecto.Changeset.change()
+      |> Ecto.Changeset.put_change(:type, :standard)
+      |> Ecto.Changeset.put_change(:sso_identity_id, nil)
+      |> Ecto.Changeset.put_assoc(:sso_integration, nil)
+      |> Ecto.Changeset.put_assoc(:sso_domain, nil)
+      |> Repo.update!()
+
+    # Log user deprovisioning
+    SSO.Audit.log_user_provisioning(updated_user, team, :deprovisioned, %{
+      details: %{
+        previous_type: :sso,
+        sessions_revoked: true
+      }
+    })
+
+    updated_user
   end
 
   @spec update_policy(Teams.Team.t(), [policy_attr()]) ::
@@ -123,8 +148,16 @@ defmodule Plausible.Auth.SSO do
       |> Ecto.Changeset.put_embed(:policy, policy_changeset)
 
     case Repo.update(changeset) do
-      {:ok, integration} -> {:ok, integration}
-      {:error, changeset} -> {:error, changeset.changes.policy}
+      {:ok, updated_team} ->
+        # Log team policy update
+        SSO.Audit.log_policy_update(updated_team, params, %{
+          details: %{updated_fields: Map.keys(params)}
+        })
+
+        {:ok, updated_team}
+
+      {:error, changeset} ->
+        {:error, changeset.changes.policy}
     end
   end
 
@@ -140,10 +173,27 @@ defmodule Plausible.Auth.SSO do
     with :ok <- check_force_sso(team, mode) do
       policy_changeset = Teams.Policy.force_sso_changeset(team.policy, mode)
 
-      team
-      |> Ecto.Changeset.change()
-      |> Ecto.Changeset.put_embed(:policy, policy_changeset)
-      |> Repo.update()
+      result =
+        team
+        |> Ecto.Changeset.change()
+        |> Ecto.Changeset.put_embed(:policy, policy_changeset)
+        |> Repo.update()
+
+      case result do
+        {:ok, updated_team} ->
+          # Log force SSO policy change
+          SSO.Audit.log_policy_update(updated_team, %{force_sso: mode}, %{
+            details: %{
+              previous_force_sso: team.policy.force_sso,
+              new_force_sso: mode
+            }
+          })
+
+          {:ok, updated_team}
+
+        error ->
+          error
+      end
     end
   end
 
@@ -398,8 +448,17 @@ defmodule Plausible.Auth.SSO do
       |> put_change(:last_sso_login, NaiveDateTime.utc_now(:second))
       |> put_assoc(:sso_domain, domain)
 
-    with {:ok, user} <- Repo.update(changeset) do
-      {:ok, :sso, integration.team, user}
+    with {:ok, updated_user} <- Repo.update(changeset) do
+      # Log SSO user provisioning
+      SSO.Audit.log_user_provisioning(updated_user, integration.team, :provisioned, %{
+        details: %{
+          identity_id: identity.id,
+          domain: domain.domain,
+          login_type: "existing_sso_user"
+        }
+      })
+
+      {:ok, :sso, integration.team, updated_user}
     end
   end
 
@@ -418,8 +477,18 @@ defmodule Plausible.Auth.SSO do
          :ok <- ensure_one_membership(user, integration.team),
          :ok <- ensure_empty_personal_team(user, integration.team),
          :ok <- Auth.UserSessions.revoke_all(user),
-         {:ok, user} <- Repo.update(changeset) do
-      {:ok, :standard, integration.team, user}
+         {:ok, updated_user} <- Repo.update(changeset) do
+      # Log user conversion from standard to SSO
+      SSO.Audit.log_user_creation(updated_user, integration.team, :converted, %{
+        previous_type: :standard,
+        details: %{
+          identity_id: identity.id,
+          domain: domain.domain,
+          sessions_revoked: true
+        }
+      })
+
+      {:ok, :standard, integration.team, updated_user}
     end
   end
 
@@ -456,6 +525,15 @@ defmodule Plausible.Auth.SSO do
              {:ok, team_membership} <-
                Teams.Invitations.create_team_membership(team, role, user, now) do
           if team_membership.role != :guest do
+            # Log new SSO user creation
+            SSO.Audit.log_user_creation(user, team, :created, %{
+              details: %{
+                identity_id: identity.id,
+                domain: domain.domain,
+                role: role
+              }
+            })
+
             {:identity, team, user}
           else
             Repo.rollback(:integration_not_found)

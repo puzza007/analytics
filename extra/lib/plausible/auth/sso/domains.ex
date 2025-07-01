@@ -123,6 +123,14 @@ defmodule Plausible.Auth.SSO.Domains do
       {:ok, _} ->
         {:ok, :ok} =
           Repo.transaction(fn ->
+            # Log domain removal before deletion
+            SSO.Audit.log_domain_event(sso_domain, :removed, %{
+              details: %{
+                force_deprovision: false,
+                users_deprovisioned: 0
+              }
+            })
+
             Repo.delete!(sso_domain)
             :ok = cancel_verification(sso_domain.domain)
           end)
@@ -133,6 +141,17 @@ defmodule Plausible.Auth.SSO.Domains do
         {:ok, :ok} =
           Repo.transaction(fn ->
             domain_users = users_by_domain(sso_domain)
+            user_count = length(domain_users)
+
+            # Log domain removal with user deprovisioning
+            SSO.Audit.log_domain_event(sso_domain, :removed, %{
+              details: %{
+                force_deprovision: true,
+                users_deprovisioned: user_count,
+                deprovisioned_users: Enum.map(domain_users, & &1.email)
+              }
+            })
+
             Enum.each(domain_users, &SSO.deprovision_user!/1)
             Repo.delete!(sso_domain)
             cancel_verification(sso_domain.domain)
@@ -173,9 +192,20 @@ defmodule Plausible.Auth.SSO.Domains do
   @spec mark_verified!(SSO.Domain.t(), SSO.Domain.verification_method(), NaiveDateTime.t()) ::
           SSO.Domain.t()
   def mark_verified!(sso_domain, method, now \\ NaiveDateTime.utc_now(:second)) do
-    sso_domain
-    |> SSO.Domain.verified_changeset(method, now)
-    |> Repo.update!()
+    updated_domain =
+      sso_domain
+      |> SSO.Domain.verified_changeset(method, now)
+      |> Repo.update!()
+
+    # Log domain validation
+    SSO.Audit.log_domain_event(updated_domain, :validated, %{
+      details: %{
+        verification_method: method,
+        verified_at: now
+      }
+    })
+
+    updated_domain
   end
 
   @spec mark_unverified!(SSO.Domain.t(), atom(), NaiveDateTime.t()) :: SSO.Domain.t()

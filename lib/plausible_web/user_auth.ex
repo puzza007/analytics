@@ -41,6 +41,17 @@ defmodule PlausibleWeb.UserAuth do
           device_name = get_device_name(conn)
           session = Auth.UserSessions.create!(user, device_name, timeout_at: identity.expires_at)
 
+          # Log SSO session creation
+          Auth.SSO.Audit.log_session_event(session, user, :created, %{
+            ip_address: get_ip_address(conn),
+            user_agent: get_user_agent(conn),
+            details: %{
+              identity_id: identity.id,
+              login_method: "sso",
+              team_id: team.id
+            }
+          })
+
           conn
           |> set_user_token(session.token)
           |> Plug.Conn.put_session("current_team_id", team.identifier)
@@ -230,6 +241,19 @@ defmodule PlausibleWeb.UserAuth do
     case ua.os do
       :unknown -> nil
       os -> os.name
+    end
+  end
+
+  defp get_ip_address(conn) do
+    conn
+    |> PlausibleWeb.RemoteIP.get()
+    |> to_string()
+  end
+
+  defp get_user_agent(conn) do
+    case Plug.Conn.get_req_header(conn, "user-agent") do
+      [user_agent | _] -> user_agent
+      [] -> nil
     end
   end
 end

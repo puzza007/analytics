@@ -69,6 +69,7 @@ defmodule Plausible.MixProject do
       {:bamboo_mua, "~> 0.2.0"},
       {:bcrypt_elixir, "~> 3.0"},
       {:bypass, "~> 2.1", only: [:dev, :test, :ce_test]},
+      {:carbonite, "~> 0.15.1"},
       {:ecto_ch, "~> 0.6.0"},
       {:cloak, "~> 1.1"},
       {:cloak_ecto, "~> 1.2"},
