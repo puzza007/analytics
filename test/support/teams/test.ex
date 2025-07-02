@@ -12,6 +12,7 @@ defmodule Plausible.Teams.Test do
   use ExUnit.CaseTemplate
 
   import Plausible.Factory
+  alias Plausible.CarboniteTestHelper
 
   defmacro __using__(_) do
     quote do
@@ -50,6 +51,17 @@ defmodule Plausible.Teams.Test do
   end
 
   def new_user(args \\ []) do
+    # Only use Carbonite context if audit is enabled
+    if Process.get(:audit_enabled, false) do
+      CarboniteTestHelper.with_audit_context("new_user", fn ->
+        create_user_internal(args)
+      end)
+    else
+      create_user_internal(args)
+    end
+  end
+
+  defp create_user_internal(args) do
     {team_args, args} = Keyword.pop(args, :team, [])
     {trial_expiry_date, args} = Keyword.pop(args, :trial_expiry_date)
 
@@ -57,7 +69,9 @@ defmodule Plausible.Teams.Test do
       args = Keyword.merge([type: :standard], args)
     end
 
-    user = insert(:user, args)
+    user = 
+      build(:user, args)
+      |> Repo.insert!()
 
     trial_expiry_date =
       if team_args != [] && !trial_expiry_date do
@@ -105,6 +119,16 @@ defmodule Plausible.Teams.Test do
   end
 
   def add_guest(site, args \\ []) do
+    if Process.get(:audit_enabled, false) do
+      CarboniteTestHelper.with_audit_context("add_guest", fn ->
+        add_guest_internal(site, args)
+      end)
+    else
+      add_guest_internal(site, args)
+    end
+  end
+
+  defp add_guest_internal(site, args) do
     user = Keyword.get(args, :user, new_user())
     role = Keyword.fetch!(args, :role)
     team = Repo.preload(site, :team).team
@@ -117,16 +141,28 @@ defmodule Plausible.Teams.Test do
         returning: true
       )
 
-    insert(:guest_membership, site: site, team_membership: team_membership, role: role)
+    build(:guest_membership, site: site, team_membership: team_membership, role: role)
+    |> Repo.insert!()
 
     user |> Repo.preload(:team_memberships)
   end
 
   def add_member(team, args \\ []) do
+    if Process.get(:audit_enabled, false) do
+      CarboniteTestHelper.with_audit_context("add_member", fn ->
+        add_member_internal(team, args)
+      end)
+    else
+      add_member_internal(team, args)
+    end
+  end
+
+  defp add_member_internal(team, args) do
     user = Keyword.get(args, :user, new_user())
     role = Keyword.fetch!(args, :role)
 
-    insert(:team_membership, team: team, user: user, role: role)
+    build(:team_membership, team: team, user: user, role: role)
+    |> Repo.insert!()
 
     user |> Repo.preload(:team_memberships)
   end

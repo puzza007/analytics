@@ -372,26 +372,41 @@ defmodule Plausible.Teams do
   end
 
   defp create_my_team(user) do
-    team =
-      %Teams.Team{}
-      |> Teams.Team.changeset(%{name: default_name()})
-      |> Repo.insert!()
+    # Create transaction metadata for Carbonite
+    transaction_metadata = %{
+      meta: %{
+        event_type: "team_creation",
+        user_id: user.id,
+        context: "get_or_create_team",
+        timestamp: NaiveDateTime.utc_now(:second)
+      }
+    }
 
-    team_membership =
-      team
-      |> Teams.Membership.changeset(user, :owner)
-      |> Ecto.Changeset.put_change(:is_autocreated, true)
-      |> Repo.insert!(
+    result =
+      Ecto.Multi.new()
+      |> Carbonite.Multi.insert_transaction(transaction_metadata)
+      |> Ecto.Multi.insert(:team, Teams.Team.changeset(%Teams.Team{}, %{name: default_name()}))
+      |> Ecto.Multi.insert(:team_membership, fn %{team: team} ->
+        team
+        |> Teams.Membership.changeset(user, :owner)
+        |> Ecto.Changeset.put_change(:is_autocreated, true)
+      end, 
         on_conflict: :nothing,
         conflict_target:
-          {:unsafe_fragment, "(user_id) WHERE role = 'owner' and is_autocreated = true"}
-      )
+          {:unsafe_fragment, "(user_id) WHERE role = 'owner' and is_autocreated = true"})
+      |> Repo.transaction()
 
-    if team_membership.id do
-      {:ok, team}
-    else
-      Repo.delete!(team)
-      {:error, :exists_already}
+    case result do
+      {:ok, %{team: team, team_membership: team_membership}} ->
+        if team_membership.id do
+          {:ok, team}
+        else
+          Repo.delete!(team)
+          {:error, :exists_already}
+        end
+
+      {:error, step, _changeset, _changes} ->
+        {:error, "Failed at step: #{step}"}
     end
   end
 end

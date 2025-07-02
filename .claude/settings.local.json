@@ -3,7 +3,14 @@
     "allow": [
       "WebFetch(domain:github.com)",
       "Bash(mix deps.get:*)",
-      "Bash(mix:*)"
+      "Bash(mix:*)",
+      "Bash(find:*)",
+      "Bash(rm:*)",
+      "Bash(MIX_ENV=test mix ecto.reset)",
+      "Bash(make:*)",
+      "Bash(grep:*)",
+      "Bash(MIX_ENV=test mix ecto.migrate)",
+      "Bash(MIX_ENV=test mix run check_triggers.exs)"
     ],
     "deny": []
   }

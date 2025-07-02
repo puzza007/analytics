@@ -68,17 +68,27 @@ defmodule Plausible.Auth.SSO do
   def update_integration(integration, params) do
     changeset = SSO.Integration.update_changeset(integration, params)
 
-    case Repo.update(changeset) do
-      {:ok, updated_integration} ->
-        # Log SSO integration update
-        SSO.Audit.log_integration_event(updated_integration, :updated, %{
-          details: %{updated_fields: Map.keys(params)}
-        })
+    audit_metadata = %{
+      integration_id: integration.id,
+      team_id: integration.team_id,
+      details: %{updated_fields: Map.keys(params)}
+    }
 
+    result =
+      Ecto.Multi.new()
+      |> Ecto.Multi.update(:integration, changeset)
+      |> SSO.Audit.add_audit_event(:sso_integration_updated, audit_metadata)
+      |> Repo.transaction()
+
+    case result do
+      {:ok, %{integration: updated_integration}} ->
         {:ok, updated_integration}
 
-      {:error, changeset} ->
+      {:error, :integration, changeset, _changes} ->
         {:error, changeset.changes.config}
+
+      {:error, _step, error, _changes} ->
+        {:error, error}
     end
   end
 
@@ -116,22 +126,31 @@ defmodule Plausible.Auth.SSO do
       [] -> %{id: nil, name: "unknown"}
     end
 
-    updated_user =
+    changeset =
       user
       |> Ecto.Changeset.change()
       |> Ecto.Changeset.put_change(:type, :standard)
       |> Ecto.Changeset.put_change(:sso_identity_id, nil)
       |> Ecto.Changeset.put_assoc(:sso_integration, nil)
       |> Ecto.Changeset.put_assoc(:sso_domain, nil)
-      |> Repo.update!()
 
-    # Log user deprovisioning
-    SSO.Audit.log_user_provisioning(updated_user, team, :deprovisioned, %{
+    audit_metadata = %{
+      user_id: user.id,
+      team_id: team.id,
       details: %{
         previous_type: :sso,
-        sessions_revoked: true
+        sessions_revoked: true,
+        user_email: user.email,
+        user_type: :standard,
+        team_name: team.name
       }
-    })
+    }
+
+    {:ok, %{user: updated_user}} =
+      Ecto.Multi.new()
+      |> Ecto.Multi.update(:user, changeset)
+      |> SSO.Audit.add_audit_event(:sso_deprovisioned, audit_metadata)
+      |> Repo.transaction()
 
     updated_user
   end

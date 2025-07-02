@@ -13,6 +13,9 @@ use Plausible
 
 import Plausible.Teams.Test
 
+# Temporarily disable Carbonite triggers during seed operations
+Plausible.CarboniteSetup.disable_triggers(Plausible.CarboniteSetup.audited_tables())
+
 FunWithFlags.enable(:starter_tier)
 
 words =
@@ -325,3 +328,6 @@ end)
 site_import
 |> Plausible.Imported.SiteImport.complete_changeset()
 |> Plausible.Repo.update!()
+
+# Re-enable Carbonite triggers after seed operations
+Plausible.CarboniteSetup.enable_triggers(Plausible.CarboniteSetup.audited_tables())

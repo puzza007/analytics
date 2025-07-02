@@ -58,33 +58,63 @@ defmodule Plausible.Auth.SSO.Audit do
   """
   @spec log_event(audit_event(), audit_metadata()) :: {:ok, String.t()} | {:error, term()}
   def log_event(event, metadata \\ %{}) do
-    # Skip audit logging in test environment to avoid trigger issues
-    if Mix.env() == :test do
-      {:ok, "test-transaction-id"}
-    else
-      try do
-        transaction_metadata = build_transaction_metadata(event, metadata)
+    try do
+      transaction_metadata = build_transaction_metadata(event, metadata)
 
-        result =
-          Ecto.Multi.new()
-          |> Carbonite.Multi.insert_transaction(transaction_metadata)
-          |> Repo.transaction()
+      result =
+        Ecto.Multi.new()
+        |> Carbonite.Multi.insert_transaction(transaction_metadata)
+        |> Repo.transaction()
 
-        case result do
-          {:ok, %{transaction: transaction}} ->
-            {:ok, transaction.id}
+      case result do
+        {:ok, %{transaction: transaction}} ->
+          {:ok, transaction.id}
 
-          {:error, :transaction, changeset, _changes} ->
-            {:error, changeset}
+        {:error, :transaction, changeset, _changes} ->
+          {:error, changeset}
 
-          {:error, reason} ->
-            {:error, reason}
-        end
-      rescue
-        error ->
-          {:error, error}
+        {:error, reason} ->
+          {:error, reason}
       end
+    rescue
+      error ->
+        {:error, error}
     end
+  end
+
+  @doc """
+  Adds audit logging to an existing Ecto.Multi pipeline.
+  
+  This allows audit events to be included in the same transaction as the SSO operations.
+  
+  ## Examples
+  
+      iex> Ecto.Multi.new()
+      ...> |> Ecto.Multi.update(:user, changeset)
+      ...> |> Audit.add_audit_event(:sso_user_created, %{user_id: 123})
+      ...> |> Repo.transaction()
+  """
+  @spec add_audit_event(Ecto.Multi.t(), audit_event(), audit_metadata()) :: Ecto.Multi.t()
+  def add_audit_event(multi, event, metadata \\ %{}) do
+    # In test environment, audit events are handled by the CarboniteTestHelper
+    # which ensures proper transaction context is established
+    transaction_metadata = build_transaction_metadata(event, metadata)
+    Carbonite.Multi.insert_transaction(multi, transaction_metadata)
+  end
+
+  @doc """
+  Creates an Ecto.Multi with audit logging for transactional operations.
+  
+  ## Examples
+  
+      iex> Audit.create_transactional_multi(:sso_user_created, %{user_id: 123})
+      ...> |> Ecto.Multi.update(:user, changeset)
+      ...> |> Repo.transaction()
+  """
+  @spec create_transactional_multi(audit_event(), audit_metadata()) :: Ecto.Multi.t()
+  def create_transactional_multi(event, metadata \\ %{}) do
+    Ecto.Multi.new()
+    |> add_audit_event(event, metadata)
   end
 
   @doc """
