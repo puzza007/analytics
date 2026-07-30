@@ -57,36 +57,48 @@ defmodule Plausible.Session.TransferTest do
            "the primary mutated a session after dumping it; the replica's copy is stale"
   end
 
-  # tla/SessionTakeover_version_mismatch.cfg
+  # tla/SessionTakeover_version_mismatch.cfg — the model's invariant is
+  # primary-side: LatchMeansTransfer == given > 0 => dumped. This test asserts
+  # the primary's policy, not the replica's manners: both legs speak the socket
+  # protocol exactly the way today's replica does — request_takeover/1 sends
+  # :done from an `after` block whether or not anything was handed over
+  # (transfer.ex:143-145) — and the primary should treat the two differently.
+  # If the fix lands replica-side instead (send :done only on success), this
+  # test asserts nothing about it and should be updated in tandem.
+  #
+  # Framed as a differential on purpose. Releasing the hold QUICKLY on a
+  # declined transfer may well be desirable — holding a node 15s for a
+  # transfer that can never succeed is pure deploy latency, and maintainers
+  # treat version churn as routine (see PR #5338). The defect reproduced here
+  # is narrower: the primary cannot DISTINGUISH an empty handover from a
+  # complete one, which is also why it releases when a started fan-out is
+  # abandoned half-way (tla/SessionTakeover_fanout_await_expires.cfg).
+  #
+  # Shutdown is triggered with init:stop on the peer and timed to the node's
+  # actual exit, deliberately: peer's default shutdown is {halt, 5000}, under
+  # which peer:stop/1 makes the node erlang:halt(), skipping every
+  # supervision-tree terminate callback — including Transfer.Alive.terminate/2,
+  # which IS the hold. Timing a halted node measures nothing.
   @tag :tla_repro
-  test "the shutdown latch is released even when nothing was transferred" do
-    tmp_dir = tmp_dir()
+  @tag timeout: :timer.minutes(3)
+  test "a handover that transfers nothing keeps the hold that a complete one releases" do
+    # Positive control: when no :done arrives at all, graceful shutdown must
+    # visibly include Alive's 15s budget. This proves the measurement can see
+    # the hold — and doubles as the expected post-fix shape of the empty leg.
+    held_ms = graceful_stop_after_handover(:no_done)
 
-    old = start_another_plausible(tmp_dir)
-    process_event(old, build(:event, name: "pageview"))
+    assert held_ms >= 10_000,
+           "the 15s Alive hold was not observable via graceful shutdown " <>
+             "(node died in #{held_ms}ms): the measurement is broken, or the " <>
+             "primary's own boot-time replica raced to its socket and self-released"
 
-    [sock] = TinySock.list!(tmp_dir)
+    complete_ms = graceful_stop_after_handover(:complete)
+    nothing_ms = graceful_stop_after_handover(:nothing_transferred)
 
-    # session_version/0 is the md5 of ClickhouseSessionV2, Cache.Adapter,
-    # CacheStore and Transfer, so it differs on ANY deploy that touches one of
-    # them, and handle_replica answers with []. The stand-in has to be built
-    # from terms that already exist on the peer: TinySock decodes with
-    # binary_to_term(_, [:safe]), which refuses to intern new atoms.
-    assert {:ok, []} = TinySock.call(sock, {:list, [<<"stale-version">>]})
-
-    # ... yet request_takeover/1 sends :done from an `after` block regardless,
-    # so the primary drops its hold having handed over nothing.
-    assert {:ok, _} = TinySock.call(sock, :done)
-
-    # Alive should now hold the node open for its full 15s cap. Tearing down a
-    # peer that is NOT being held takes about a second, so 5s sits clearly
-    # between the two outcomes instead of hugging either.
-    {elapsed_us, _} = :timer.tc(fn -> :peer.stop(old) end)
-    elapsed_ms = div(elapsed_us, 1_000)
-
-    assert elapsed_ms > 5_000,
-           "primary shut down in #{elapsed_ms}ms having transferred nothing: " <>
-             "the `after` block released the 15s Alive hold"
+    assert nothing_ms >= complete_ms + 5_000,
+           "the primary released its shutdown hold after an empty handover " <>
+             "(#{nothing_ms}ms) as readily as after a complete one (#{complete_ms}ms): " <>
+             ":done carries no information about whether anything was transferred"
   end
 
   # :sessions is partitioned 100 ways (runtime.exs), so every partition has to
@@ -101,6 +113,71 @@ defmodule Plausible.Session.TransferTest do
       records
     end)
     |> Enum.sort_by(fn {key, _} -> key end)
+  end
+
+  # One handover leg: boot a primary, let a hand-rolled replica either pull
+  # everything (matching version, every partition) or get declined (stale
+  # version), close with the :done today's replica always sends, then trigger
+  # init:stop and time the node's graceful death. Returns elapsed milliseconds.
+  defp graceful_stop_after_handover(handover) do
+    tmp_dir = tmp_dir()
+    old = start_another_plausible(tmp_dir)
+    await_transfer(old)
+    process_event(old, build(:event, name: "pageview"))
+
+    [sock] = TinySock.list!(tmp_dir)
+
+    case handover do
+      :complete ->
+        # a faithful replica: matching version, every partition pulled
+        {:ok, names} = TinySock.call(sock, {:list, session_version()})
+        assert names != [], "primary declined a matching-version handover"
+        Enum.each(names, fn name -> {:ok, _} = TinySock.call(sock, {:get, name}) end)
+
+      :nothing_transferred ->
+        # transfer.ex:111 — a version mismatch declines the handover. The
+        # stand-in version must be built from terms that already exist on the
+        # peer: TinySock decodes with binary_to_term(_, [:safe]), which
+        # refuses to intern new atoms.
+        assert {:ok, []} = TinySock.call(sock, {:list, [<<"stale-version">>]})
+
+      :no_done ->
+        :ok
+    end
+
+    # outside the control leg, both replicas end identically: the :done that
+    # request_takeover/1's after block always sends
+    if handover != :no_done do
+      {:ok, _} = TinySock.call(sock, :done)
+    end
+
+    # init:stop runs the full graceful shutdown — applications stop in reverse
+    # order, the Transfer supervisor gives Alive its 15s budget, and
+    # Alive.terminate/2 blocks until the latch is released or the budget runs
+    # out. The peer's origin process exits when the node does; unlink first so
+    # its (abnormal) exit reason cannot take the test down with it.
+    ref = Process.monitor(old)
+    Process.unlink(old)
+    :ok = :peer.call(old, :init, :stop, [])
+
+    {elapsed_us, _} =
+      :timer.tc(fn ->
+        assert_receive {:DOWN, ^ref, :process, _, _}, :timer.seconds(60)
+      end)
+
+    div(elapsed_us, 1_000)
+  end
+
+  # Mirrors Plausible.Session.Transfer.session_version/0 (transfer.ex:168-175),
+  # which is private. Valid because this test node loads the very beams the
+  # peer adds to its code path, so the md5s agree by construction.
+  defp session_version do
+    [
+      Plausible.ClickhouseSessionV2.module_info(:md5),
+      Plausible.Cache.Adapter.module_info(:md5),
+      Plausible.Session.CacheStore.module_info(:md5),
+      Plausible.Session.Transfer.module_info(:md5)
+    ]
   end
 
   defp start_another_plausible(tmp_dir) do
