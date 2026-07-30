@@ -24,7 +24,7 @@
 (*     `start_link` returns immediately and the Phoenix endpoint (a LATER    *)
 (*     child, application.ex:205) starts while the takeover is still         *)
 (*     running.  The new node therefore ACCEPTS TRAFFIC during takeover -    *)
-(*     and `takeover_cache/2` then does an unconditional                     *)
+(*     and pre-fix `takeover_cache/2` did an unconditional                   *)
 (*     `Cache.Adapter.put(:sessions, key, session)` over whatever the new    *)
 (*     node has already created.                                            *)
 (*                                                                          *)
@@ -114,7 +114,27 @@ CONSTANTS
     DrainBeforeTakeover,
     \* TRUE lets `Task.await_many(tasks, 10s)` (transfer.ex:141) expire, so the
     \* fan-out is abandoned with some partitions applied and others not.
-    AwaitCapFires
+    AwaitCapFires,
+    (***********************************************************************)
+    (* THE FIX for the snapshot-of-a-moving-target family (shipped; the     *)
+    (* knobs keep the as-written configs reproducing the pre-fix bugs).     *)
+    (* Neither knob gates the new node's readiness and neither drops        *)
+    (* traffic: serving["new"] stays TRUE throughout, so NoTrafficGap can   *)
+    (* hold alongside the corruption invariants.                            *)
+    (***********************************************************************)
+    \* The primary declines {:list}/{:get} until it is DRAINING, and the
+    \* replica polls until then.  Physically: the endpoint stops before
+    \* Transfer in supervision shutdown order, so by the time dumps are
+    \* served the cache is final.  The real replica's poll has a deadline
+    \* (give up = today's no-transfer behaviour); the deadline is not
+    \* modelled - fairness of `shutdown` stands in for "the old node does
+    \* eventually drain".
+    PullAfterDrain,
+    \* The restore uses insert_new instead of a blind put: a session this
+    \* node already owns is kept, and the imported copy is dropped.  The
+    \* dropped copy's final +1 row stands as a correctly terminated visit,
+    \* so the visitor splits (benign) instead of corrupting the ledger.
+    PutNew
 
 ASSUME MaxEvents \in Nat /\ MaxEvents >= 1
 
@@ -191,6 +211,8 @@ begin
   \* TinySock.call(sock, {:list, session_version()}).  handle_replica answers []
   \* unless the version matches AND the primary's own takeover has finished.
   RList:
+    \* With the fix, the replica polls until the primary drains.
+    await ~PullAfterDrain \/ ~serving["old"];
     gotNames := VersionMatches /\ OldAttempted;
     listed   := TRUE;
 
@@ -222,9 +244,12 @@ begin
     \* accepting traffic, so :ets.tab2list returns a final state.
     await ~DrainBeforeTakeover \/ pc["shutdown"] # "SDrain";
     if gotNames /\ ~awaitExpired then
-        \* Cache.Adapter.put is unconditional: it clobbers whatever the new node
-        \* already holds for this key.  transfer.ex:151-157
-        sess   := [sess EXCEPT !["new"][self] = sess["old"][self]];
+        \* As written, Cache.Adapter.put is unconditional: it clobbers whatever
+        \* the new node already holds for this key (transfer.ex:151-157).  With
+        \* PutNew, a locally-owned session wins and the import is dropped.
+        if ~PutNew \/ sess["new"][self] = NULL then
+            sess := [sess EXCEPT !["new"][self] = sess["old"][self]];
+        end if;
         pulled := [pulled EXCEPT ![self] = TRUE];
     end if;
 end process;
@@ -331,6 +356,7 @@ Ing == /\ pc["ingest"] = "Ing"
 ingest == Ing
 
 RList == /\ pc["replica"] = "RList"
+         /\ ~PullAfterDrain \/ ~serving["old"]
          /\ gotNames' = (VersionMatches /\ OldAttempted)
          /\ listed' = TRUE
          /\ pc' = [pc EXCEPT !["replica"] = "RAwait"]
@@ -370,7 +396,10 @@ TPull(self) == /\ pc[self] = "TPull"
                /\ listed
                /\ ~DrainBeforeTakeover \/ pc["shutdown"] # "SDrain"
                /\ IF gotNames /\ ~awaitExpired
-                     THEN /\ sess' = [sess EXCEPT !["new"][self] = sess["old"][self]]
+                     THEN /\ IF ~PutNew \/ sess["new"][self] = NULL
+                                THEN /\ sess' = [sess EXCEPT !["new"][self] = sess["old"][self]]
+                                ELSE /\ TRUE
+                                     /\ sess' = sess
                           /\ pulled' = [pulled EXCEPT ![self] = TRUE]
                      ELSE /\ TRUE
                           /\ UNCHANGED << sess, pulled >>

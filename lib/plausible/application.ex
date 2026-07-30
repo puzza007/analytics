@@ -58,6 +58,9 @@ defmodule Plausible.Application do
           n_lock_partitions: 1,
           ets_options: [read_concurrency: true, write_concurrency: true]
         ),
+        # Must start before the endpoint: on shutdown the endpoint then stops
+        # first, and Session.Transfer.Drain relies on that to know the
+        # :sessions cache is final before serving dumps (see drain.ex).
         {Plausible.Session.Transfer,
          base_path: Application.get_env(:plausible, :session_transfer_dir)},
         warmed_cache(Plausible.Site.Cache,

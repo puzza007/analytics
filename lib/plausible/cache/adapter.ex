@@ -96,6 +96,16 @@ defmodule Plausible.Cache.Adapter do
       nil
   end
 
+  @spec put_new(atom(), any(), any()) :: :ok | {:error, :already_exists}
+  def put_new(cache_name, key, value) do
+    full_cache_name = get_name(cache_name, key)
+    ConCache.dirty_insert_new(full_cache_name, key, value)
+  catch
+    :exit, _ ->
+      Logger.error("Error putting a new key to '#{cache_name}'")
+      :ok
+  end
+
   @spec put_many(atom(), [any()]) :: :ok
   def put_many(cache_name, items) when is_list(items) do
     items

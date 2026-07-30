@@ -62,6 +62,9 @@ config — otherwise it masks everything after it.
 | `version_mismatch` | any deploy touching one of the four md5-hashed modules |
 | `fix_done_only_on_success` | sending `:done` only on success — honest, but does it recover the sessions? |
 | `drainfirst_cost` | the traffic gap drain-first buys the fix with |
+| `fix` | THE SHIPPED FIX: primary declines dumps until draining, replica polls, restore keeps locally-owned sessions — all corruption invariants AND `NoTrafficGap` hold (**passes**) |
+| `fix_split_cost` | the fix's price: the visitor may split across the deploy instead of being lost or corrupted |
+| `fix_awaitcap` | the fix does NOT close the abandoned fan-out (finding 5) — `NoPartialTakeover` still fails |
 | `liveness` | can the new node fail to ever become ready? |
 
 ## Repro tests

@@ -13,49 +13,52 @@ defmodule Plausible.Session.TransferTest do
     await_transfer(old)
 
     Enum.each(1..250, fn _ -> process_event(old, build(:event, name: "pageview")) end)
+    expected = all_sessions_sorted(old)
 
     new = start_another_plausible(tmp_dir)
-    await_transfer(new)
 
-    assert all_sessions_sorted(new) == all_sessions_sorted(old)
+    # the new node's replica polls until the old node starts draining
+    begin_graceful_stop(old)
+    await_transfer(new, :timer.seconds(15))
+
+    assert all_sessions_sorted(new) == expected
   end
 
-  # The two tests below reproduce races found by model checking
-  # tla/SessionTakeover.tla. They fail by design until the races are closed, so
-  # :tla_repro is in default_exclude (test_helper.exs); run them with
-  # `mix test --only tla_repro`.
-  #
-  # "it works" above passes because it calls await_transfer(new) before doing
-  # anything else, so it only ever observes a handover that has already
-  # finished. These probe the window it skips.
-
-  # tla/SessionTakeover_fanout_as_written.cfg. No :slow tag: CI runs with --include
-  # slow, and an ExUnit include beats an exclude.
-  @tag :tla_repro
-  test "a session dumped for takeover is a snapshot the primary keeps mutating past" do
+  # Verifies the fix modelled in tla/SessionTakeover_fix.cfg (this test was
+  # previously the red repro for tla/SessionTakeover_fanout_as_written.cfg,
+  # where the dump was an ets.tab2list snapshot of a still-serving primary).
+  @tag :slow
+  test "a primary declines dumps until it drains, and the dump is then final" do
     tmp_dir = tmp_dir()
 
     old = start_another_plausible(tmp_dir)
     await_transfer(old)
 
-    event = build(:event, name: "pageview")
-    process_event(old, event)
+    process_event(old, build(:event, name: "pageview"))
 
     [sock] = TinySock.list!(tmp_dir)
 
-    snapshot = dump_via_socket(sock)
-    assert snapshot != [], "nothing was dumped; the rest of this test would be vacuous"
+    # a live primary refuses: its cache is still a moving target
+    assert {:ok, :not_draining} = TinySock.call(sock, {:list, session_version()})
 
-    # The primary keeps serving after being dumped: the endpoint is not stopped,
-    # and Alive holds the node open for up to 15 more seconds.
-    process_event(old, event)
+    expected = all_sessions_sorted(old)
 
-    # A replica holding `snapshot` now has a session the primary has already
-    # superseded. Its next event for that visitor cancels a version the primary
-    # has already cancelled, giving sessions_v2 two sign=-1 rows for one sign=+1.
-    assert dump_via_socket(sock) == snapshot,
-           "the primary mutated a session after dumping it; the replica's copy is stale"
+    # once shutdown begins the endpoint is stopped, the cache is final, and
+    # Alive holds the node open for the handover
+    ref = begin_graceful_stop(old)
+    assert await_names(sock) != []
+
+    assert dump_via_socket(sock) == expected,
+           "the dump differs from the primary's state at drain: it was not final"
+
+    {:ok, _} = TinySock.call(sock, :done)
+    assert_receive {:DOWN, ^ref, :process, _, _}, :timer.seconds(60)
   end
+
+  # The test below reproduces a race found by model checking
+  # tla/SessionTakeover.tla. It fails by design until the race is closed, so
+  # :tla_repro is in default_exclude (test_helper.exs); run it with
+  # `mix test --only tla_repro`.
 
   # tla/SessionTakeover_version_mismatch.cfg — the model's invariant is
   # primary-side: LatchMeansTransfer == given > 0 => dumped. This test asserts
@@ -74,11 +77,11 @@ defmodule Plausible.Session.TransferTest do
   # complete one, which is also why it releases when a started fan-out is
   # abandoned half-way (tla/SessionTakeover_fanout_await_expires.cfg).
   #
-  # Shutdown is triggered with init:stop on the peer and timed to the node's
-  # actual exit, deliberately: peer's default shutdown is {halt, 5000}, under
-  # which peer:stop/1 makes the node erlang:halt(), skipping every
-  # supervision-tree terminate callback — including Transfer.Alive.terminate/2,
-  # which IS the hold. Timing a halted node measures nothing.
+  # Each leg begins the shutdown first: dumps are only served once the primary
+  # drains. Timing uses init:stop and the node's monitored exit, deliberately:
+  # peer's default {halt, 5000} shutdown skips every supervision-tree
+  # terminate callback — including Transfer.Alive.terminate/2, which IS the
+  # hold. Timing a halted node measures nothing.
   @tag :tla_repro
   @tag timeout: :timer.minutes(3)
   test "a handover that transfers nothing keeps the hold that a complete one releases" do
@@ -115,10 +118,11 @@ defmodule Plausible.Session.TransferTest do
     |> Enum.sort_by(fn {key, _} -> key end)
   end
 
-  # One handover leg: boot a primary, let a hand-rolled replica either pull
-  # everything (matching version, every partition) or get declined (stale
-  # version), close with the :done today's replica always sends, then trigger
-  # init:stop and time the node's graceful death. Returns elapsed milliseconds.
+  # One handover leg: boot a primary, begin its graceful shutdown, then let a
+  # hand-rolled replica either pull everything during the drain window
+  # (matching version, every partition) or get declined (stale version), close
+  # with the :done today's replica always sends, and time the node's graceful
+  # death from init:stop. Returns elapsed milliseconds.
   defp graceful_stop_after_handover(handover) do
     tmp_dir = tmp_dir()
     old = start_another_plausible(tmp_dir)
@@ -127,17 +131,23 @@ defmodule Plausible.Session.TransferTest do
 
     [sock] = TinySock.list!(tmp_dir)
 
+    # init:stop runs the full graceful shutdown — applications stop in reverse
+    # order, the Transfer supervisor gives Alive its 15s budget, and
+    # Alive.terminate/2 blocks until the latch is released or the budget runs
+    # out. Dumps are served during that window.
+    ref = begin_graceful_stop(old)
+    started = System.monotonic_time(:millisecond)
+
     case handover do
       :complete ->
         # a faithful replica: matching version, every partition pulled
-        {:ok, names} = TinySock.call(sock, {:list, session_version()})
-        assert names != [], "primary declined a matching-version handover"
+        names = await_names(sock)
         Enum.each(names, fn name -> {:ok, _} = TinySock.call(sock, {:get, name}) end)
 
       :nothing_transferred ->
-        # transfer.ex:111 — a version mismatch declines the handover. The
-        # stand-in version must be built from terms that already exist on the
-        # peer: TinySock decodes with binary_to_term(_, [:safe]), which
+        # a version mismatch declines the handover outright, drained or not.
+        # The stand-in version must be built from terms that already exist on
+        # the peer: TinySock decodes with binary_to_term(_, [:safe]), which
         # refuses to intern new atoms.
         assert {:ok, []} = TinySock.call(sock, {:list, [<<"stale-version">>]})
 
@@ -151,21 +161,34 @@ defmodule Plausible.Session.TransferTest do
       {:ok, _} = TinySock.call(sock, :done)
     end
 
-    # init:stop runs the full graceful shutdown — applications stop in reverse
-    # order, the Transfer supervisor gives Alive its 15s budget, and
-    # Alive.terminate/2 blocks until the latch is released or the budget runs
-    # out. The peer's origin process exits when the node does; unlink first so
-    # its (abnormal) exit reason cannot take the test down with it.
-    ref = Process.monitor(old)
-    Process.unlink(old)
-    :ok = :peer.call(old, :init, :stop, [])
+    assert_receive {:DOWN, ^ref, :process, _, _}, :timer.seconds(60)
+    System.monotonic_time(:millisecond) - started
+  end
 
-    {elapsed_us, _} =
-      :timer.tc(fn ->
-        assert_receive {:DOWN, ^ref, :process, _, _}, :timer.seconds(60)
-      end)
+  # The peer's origin process exits when the node does; unlink first so its
+  # (abnormal) exit reason cannot take the test down with it.
+  defp begin_graceful_stop(peer) do
+    ref = Process.monitor(peer)
+    Process.unlink(peer)
+    :ok = :peer.call(peer, :init, :stop, [])
+    ref
+  end
 
-    div(elapsed_us, 1_000)
+  # A live primary answers :not_draining; poll like the real replica does.
+  # Returns the cache names or flunks - a deadline must not slip through the
+  # callers' pattern matches as a puzzling downstream error.
+  defp await_names(sock, deadline_ms \\ :timer.seconds(10)) do
+    case TinySock.call(sock, {:list, session_version()}) do
+      {:ok, :not_draining} when deadline_ms > 0 ->
+        Process.sleep(100)
+        await_names(sock, deadline_ms - 100)
+
+      {:ok, [_ | _] = names} ->
+        names
+
+      other ->
+        flunk("draining primary did not hand over its cache names, got: #{inspect(other)}")
+    end
   end
 
   # Mirrors Plausible.Session.Transfer.session_version/0 (transfer.ex:168-175),
