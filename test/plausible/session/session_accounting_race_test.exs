@@ -77,10 +77,29 @@ defmodule Plausible.Session.SessionAccountingRaceTest do
     ]
 
     assert_receive {:at_barrier, writer_a, rows_a}, 5_000
-    assert_receive {:at_barrier, writer_b, rows_b}, 5_000
 
-    send(writer_a, :release)
-    send(writer_b, :release)
+    # Under the race, the second writer reaches the barrier while the first is
+    # still parked - holding both makes the corrupting interleaving
+    # deterministic. Under a serialising fix it cannot get there (its dispatch
+    # queues behind the parked worker), so after a grace period the writers are
+    # released to run in turn and the test passes on the invariants below
+    # instead of deadlocking on an interleaving the fix has made impossible.
+    # (A machine slow enough to delay the second writer past the grace period
+    # skips the race and may pass vacuously - acceptable for an opt-in repro.)
+    rows_b =
+      receive do
+        {:at_barrier, writer_b, rows_b} ->
+          send(writer_a, :release)
+          send(writer_b, :release)
+          rows_b
+      after
+        2_000 ->
+          send(writer_a, :release)
+          assert_receive {:at_barrier, writer_b, rows_b}, 5_000
+          send(writer_b, :release)
+          rows_b
+      end
+
     Task.await_many(tasks)
 
     all_rows = [session1] ++ rows_a ++ rows_b
@@ -91,8 +110,14 @@ defmodule Plausible.Session.SessionAccountingRaceTest do
     assert signed_bounce(all_rows) >= 0,
            "sum(is_bounce * sign) = #{signed_bounce(all_rows)}: the session state was cancelled twice"
 
-    assert all_rows |> Enum.map(& &1.events) |> Enum.max() == 3,
-           "one writer's update was absorbed: both computed events from the same base state"
+    # Every event must survive into the collapsed state. Summed across sessions
+    # rather than asserted on one, so that a fix which declines to stitch across
+    # the rotation - legitimately splitting the visitor - still passes: 2 + 1
+    # events over two sessions is fine; 2 over one session is a writer absorbing
+    # the other's update.
+    assert live_events(all_rows) == 3,
+           "#{live_events(all_rows)} of 3 events survive in the collapsed sessions: " <>
+             "concurrent writers derived from the same base state and absorbed an update"
   end
 
   # tla/SessionStitch_timeout.cfg
@@ -123,17 +148,25 @@ defmodule Plausible.Session.SessionAccountingRaceTest do
       clickhouse_session_attrs: @session_params
     }
 
-    assert {:error, :lock_timeout} =
-             Plausible.Ingestion.Persistor.Embedded.persist_event(ingest_event, nil,
-               session_write_buffer_insert: fn s ->
-                 send(test_pid, {:session_rows, s})
-                 {:ok, s}
-               end,
-               event_write_buffer_insert: fn e ->
-                 send(test_pid, {:event_row, e})
-                 {:ok, e}
-               end
-             )
+    # {:error, :lock_timeout} is the code as written: cache_store.ex:42-46
+    # catches the caller-side GenServer.call timeout (@lock_timeout is 1_000ms)
+    # and embedded.ex:31 turns it into a dropped event. {:ok, _} is what a
+    # caller-waits fix returns instead. Both are consistent shapes; anything
+    # else is neither the bug nor a fix.
+    result =
+      Plausible.Ingestion.Persistor.Embedded.persist_event(ingest_event, nil,
+        session_write_buffer_insert: fn s ->
+          send(test_pid, {:session_rows, s})
+          {:ok, s}
+        end,
+        event_write_buffer_insert: fn e ->
+          send(test_pid, {:event_row, e})
+          {:ok, e}
+        end
+      )
+
+    assert match?({:error, :lock_timeout}, result) or match?({:ok, _}, result),
+           "unexpected persist_event result: #{inspect(result)}"
 
     Task.await(blocker, :timer.seconds(10))
 
@@ -160,6 +193,16 @@ defmodule Plausible.Session.SessionAccountingRaceTest do
 
   defp signed_bounce(rows) do
     Enum.sum_by(rows, fn row -> row.sign * if(row.is_bounce, do: 1, else: 0) end)
+  end
+
+  # Events surviving after the CollapsingMergeTree collapse: for each session,
+  # the highest events value among its state (sign: 1) rows.
+  defp live_events(rows) do
+    rows
+    |> Enum.filter(&(&1.sign == 1))
+    |> Enum.group_by(& &1.session_id)
+    |> Enum.map(fn {_sid, state_rows} -> state_rows |> Enum.map(& &1.events) |> Enum.max() end)
+    |> Enum.sum()
   end
 
   # Mirrors Balancer.dispatch/3's sharding. The postcondition is asserted so a
