@@ -23,7 +23,10 @@ if :minio in Keyword.fetch!(ExUnit.configuration(), :include) do
   Plausible.TestUtils.ensure_minio()
 end
 
-default_exclude = [:slow, :minio, :migrations]
+# :tla_repro marks tests that reproduce races found by the TLA+ specs in tla/.
+# They fail by design until the races are closed, so they stay excluded even
+# from the CI runs that opt into :slow. Run them with `mix test --only tla_repro`.
+default_exclude = [:slow, :minio, :migrations, :tla_repro]
 
 # avoid slowdowns contacting the code server
 for {app, _, _} <- Application.loaded_applications() do
